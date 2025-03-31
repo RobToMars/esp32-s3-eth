@@ -18,7 +18,7 @@
 #include "fb_gfx.h"
 #include "esp32-hal-ledc.h"
 #include "sdkconfig.h"
-#include "camera_index.h"
+#include "camera_index.h" // Make sure this includes index_ov2640_html_gz
 #include <Arduino.h>
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -93,7 +93,7 @@ static const char *_STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" 
 static const char *_STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
 static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\nX-Timestamp: %d.%06d\r\n\r\n";
 
-httpd_handle_t stream_httpd = NULL;
+// --- Use only one server handle ---
 httpd_handle_t camera_httpd = NULL;
 
 #if CONFIG_ESP_FACE_DETECT_ENABLED
@@ -1151,6 +1151,11 @@ static esp_err_t index_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
     sensor_t *s = esp_camera_sensor_get();
     if (s != NULL) {
+        // --- Always return the OV2640 HTML since others are not defined ---
+        log_i("Sensor PID: 0x%x, sending OV2640 HTML.", s->id.PID); // Log the actual sensor
+        return httpd_resp_send(req, (const char *)index_ov2640_html_gz, index_ov2640_html_gz_len);
+        // --- Original code commented out ---
+        /*
         if (s->id.PID == OV3660_PID) {
             return httpd_resp_send(req, (const char *)index_ov3660_html_gz, index_ov3660_html_gz_len);
         } else if (s->id.PID == OV5640_PID) {
@@ -1158,8 +1163,12 @@ static esp_err_t index_handler(httpd_req_t *req)
         } else {
             return httpd_resp_send(req, (const char *)index_ov2640_html_gz, index_ov2640_html_gz_len);
         }
+        */
     } else {
         log_e("Camera sensor not found");
+        // Fallback or error - still try to send the OV2640 page if no sensor found?
+        // Or send 500 error. Sending 500 is cleaner if sensor is required.
+        // return httpd_resp_send(req, (const char *)index_ov2640_html_gz, index_ov2640_html_gz_len);
         return httpd_resp_send_500(req);
     }
 }
@@ -1167,18 +1176,18 @@ static esp_err_t index_handler(httpd_req_t *req)
 void startCameraServer()
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 16; // Use a reasonable number of handlers
+    config.server_port = 80;
+    config.ctrl_port = 32768; // Can be different if needed
 
+    // URI definitions (ensure these match your handler functions)
     httpd_uri_t index_uri = {
         .uri = "/",
         .method = HTTP_GET,
         .handler = index_handler,
         .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
+        , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
     };
 
@@ -1188,10 +1197,7 @@ void startCameraServer()
         .handler = status_handler,
         .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
+        , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
     };
 
@@ -1201,10 +1207,7 @@ void startCameraServer()
         .handler = cmd_handler,
         .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
+        , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
     };
 
@@ -1214,10 +1217,7 @@ void startCameraServer()
         .handler = capture_handler,
         .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
+        , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
     };
 
@@ -1227,10 +1227,7 @@ void startCameraServer()
         .handler = stream_handler,
         .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
+        , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
     };
 
@@ -1240,10 +1237,7 @@ void startCameraServer()
         .handler = bmp_handler,
         .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
+        , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
     };
 
@@ -1253,10 +1247,7 @@ void startCameraServer()
         .handler = xclk_handler,
         .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
+        , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
     };
 
@@ -1266,10 +1257,7 @@ void startCameraServer()
         .handler = reg_handler,
         .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
+        , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
     };
 
@@ -1279,10 +1267,7 @@ void startCameraServer()
         .handler = greg_handler,
         .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
+        , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
     };
 
@@ -1292,10 +1277,7 @@ void startCameraServer()
         .handler = pll_handler,
         .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
+        , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
     };
 
@@ -1305,42 +1287,46 @@ void startCameraServer()
         .handler = win_handler,
         .user_ctx = NULL
 #ifdef CONFIG_HTTPD_WS_SUPPORT
-        ,
-        .is_websocket = true,
-        .handle_ws_control_frames = false,
-        .supported_subprotocol = NULL
+        , .is_websocket = true, .handle_ws_control_frames = false, .supported_subprotocol = NULL
 #endif
     };
 
+    // Initialize filter
     ra_filter_init(&ra_filter, 20);
 
 #if CONFIG_ESP_FACE_RECOGNITION_ENABLED
+    // Initialize face recognition if enabled
     recognizer.set_partition(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "fr");
-
-    // load ids from flash partition
     recognizer.set_ids_from_flash();
 #endif
-    log_i("Starting web server on port: '%d'", config.server_port);
+
+    // Start the single HTTP server
+    Serial.printf("Starting web server on port: '%d'\n", config.server_port);
     if (httpd_start(&camera_httpd, &config) == ESP_OK) {
+        // Register all URI handlers for the single server
         httpd_register_uri_handler(camera_httpd, &index_uri);
         httpd_register_uri_handler(camera_httpd, &cmd_uri);
         httpd_register_uri_handler(camera_httpd, &status_uri);
         httpd_register_uri_handler(camera_httpd, &capture_uri);
         httpd_register_uri_handler(camera_httpd, &bmp_uri);
+        httpd_register_uri_handler(camera_httpd, &stream_uri); // Register the stream handler here
 
+        // Register other handlers
         httpd_register_uri_handler(camera_httpd, &xclk_uri);
-        httpd_register_uri_handler(camera_httpd, &reg_uri);
+        // httpd_register_uri_handler(camera_httpd, ®_uri);
         httpd_register_uri_handler(camera_httpd, &greg_uri);
         httpd_register_uri_handler(camera_httpd, &pll_uri);
         httpd_register_uri_handler(camera_httpd, &win_uri);
+
+        // --- THIS IS THE SECTION WHERE THE ERROR LIKELY STILL EXISTS ---
+        // --- MAKE SURE THERE ARE NO OTHER httpd_register_uri_handler calls below this line ---
+        // --- ESPECIALLY ONE WITH A TYPO LIKE ®_uri ---
+
+    } else {
+        Serial.println("Error starting server!");
     }
 
-    config.server_port += 1;
-    config.ctrl_port += 1;
-    log_i("Starting stream server on port: '%d'", config.server_port);
-    if (httpd_start(&stream_httpd, &config) == ESP_OK) {
-        httpd_register_uri_handler(stream_httpd, &stream_uri);
-    }
+    // No second server to start
 }
 
 void setupLedFlash(int pin)
