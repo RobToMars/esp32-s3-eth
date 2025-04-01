@@ -1,3 +1,13 @@
+ESP32-S3-ETH Web Camera - Test Runner
+======================================
+TestRunner started on 18 test(s).
+/home/rob/GIT/ETH_Web_CAM/tests/test_runner/../test_gpio.h:60: Assertion failed: (600) == (-1).
+Test GpioAnalogInput failed.
+Test GpioAnalogOutput passed.
+Test GpioDigitalOutput passed.
+/home/rob/GIT/ETH_Web_CAM/tests/test_runner/../test_gpio.h:104: Assertion failed: (2) == (3).
+Test GpioMultipleDigitalOutputs failed.
+Test GpioOverview passed.
 Test GpioPinSafety passed.
 Test HttpServerInitialization passed.
 Test IntegrationCameraNetwork passed.
