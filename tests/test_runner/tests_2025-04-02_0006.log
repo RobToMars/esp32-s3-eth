@@ -1,0 +1,16 @@
+Test GpioPinSafety passed.
+Test HttpServerInitialization passed.
+Test IntegrationCameraNetwork passed.
+Test IntegrationGpioNeopixel passed.
+Test IntegrationNetworkGpio passed.
+Test NeoPixelInitialization passed.
+Test NeoPixelRgbValidation passed.
+Test NeoPixelSetColor passed.
+Test NeoPixelTurnOff passed.
+Test NetworkConfigDHCP passed.
+/home/rob/GIT/ETH_Web_CAM/tests/test_runner/../test_network.h:133: Assertion failed: (true) is false.
+Test NetworkConfigIPValidation failed.
+Test NetworkConfigInitialization passed.
+Test NetworkConfigStaticIP passed.
+TestRunner duration: 0.002 seconds.
+TestRunner summary: 15 passed, 3 failed, 0 skipped, 0 timed out, out of 18 test(s).
