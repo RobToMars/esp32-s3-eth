@@ -4,135 +4,106 @@
 #include <AUnit.h>
 #include "test_common.h"
 #include "network_config_wrapper.h"
-
-// Define NETWORK_CONFIG_FILE for tests
-#define NETWORK_CONFIG_FILE "/network_config.json"
+#include "test_mock_implementations.h"
 
 // Test network configuration initialization
 test(NetworkConfigInitialization) {
-  // Create a test network configuration
-  TestNetworkConfig config;
+  // Test initializing network configuration
+  initNetworkConfig();
   
-  // Initialize with default values
-  config.dhcp = false;
+  // Verify default values
+  assertEqual(networkConfig.dhcp_enabled, false);
+  assertEqual(networkConfig.ip[0], 192);
+  assertEqual(networkConfig.ip[1], 168);
+  assertEqual(networkConfig.ip[2], 178);
+  assertEqual(networkConfig.ip[3], 65);
   
-  const char* ipStr = "0.0.0.0";
-  const char* gatewayStr = "0.0.0.0";
-  const char* subnetStr = "0.0.0.0";
+  assertEqual(networkConfig.gateway[0], 192);
+  assertEqual(networkConfig.gateway[1], 168);
+  assertEqual(networkConfig.gateway[2], 178);
+  assertEqual(networkConfig.gateway[3], 1);
   
-  for (int i = 0; i < strlen(ipStr) && i < 16; i++) {
-    config.ip[i] = (uint8_t)ipStr[i];
-  }
-  config.ip[strlen(ipStr) < 16 ? strlen(ipStr) : 15] = 0;
+  assertEqual(networkConfig.subnet[0], 255);
+  assertEqual(networkConfig.subnet[1], 255);
+  assertEqual(networkConfig.subnet[2], 255);
+  assertEqual(networkConfig.subnet[3], 0);
   
-  for (int i = 0; i < strlen(gatewayStr) && i < 16; i++) {
-    config.gateway[i] = (uint8_t)gatewayStr[i];
-  }
-  config.gateway[strlen(gatewayStr) < 16 ? strlen(gatewayStr) : 15] = 0;
+  assertEqual(networkConfig.dns1[0], 8);
+  assertEqual(networkConfig.dns1[1], 8);
+  assertEqual(networkConfig.dns1[2], 8);
+  assertEqual(networkConfig.dns1[3], 8);
   
-  for (int i = 0; i < strlen(subnetStr) && i < 16; i++) {
-    config.subnet[i] = (uint8_t)subnetStr[i];
-  }
-  config.subnet[strlen(subnetStr) < 16 ? strlen(subnetStr) : 15] = 0;
+  assertEqual(networkConfig.dns2[0], 8);
+  assertEqual(networkConfig.dns2[1], 8);
+  assertEqual(networkConfig.dns2[2], 4);
+  assertEqual(networkConfig.dns2[3], 4);
   
-  // Load test configuration
-  mockLoadNetworkConfig(NETWORK_CONFIG_FILE, &config);
-  
-  // Verify configuration was loaded
-  assertTrue(config.dhcp);
-  
-  // Convert uint8_t arrays to char arrays for comparison
-  char ipStrLoaded[17];
-  for (int i = 0; i < 16; i++) {
-    ipStrLoaded[i] = (char)config.ip[i];
-    if (config.ip[i] == 0) break;
-  }
-  ipStrLoaded[16] = 0;
-  
-  // Verify IP address
-  assertEqual(strcmp(ipStrLoaded, "192.168.1.100"), 0);
+  assertEqual(strcmp(networkConfig.hostname, "esp32-ethernet"), 0);
 }
 
-// Test setting static IP configuration
+// Test static IP configuration
 test(NetworkConfigStaticIP) {
-  // Create a test network configuration
-  TestNetworkConfig config;
+  // Test setting static IP
+  networkConfig.dhcp_enabled = false;
+  networkConfig.ip[0] = 192;
+  networkConfig.ip[1] = 168;
+  networkConfig.ip[2] = 1;
+  networkConfig.ip[3] = 100;
   
-  // Set static IP configuration
-  config.dhcp = false;
-  
-  const char* ipStr = "192.168.1.200";
-  const char* gatewayStr = "192.168.1.1";
-  const char* subnetStr = "255.255.255.0";
-  
-  for (int i = 0; i < strlen(ipStr) && i < 16; i++) {
-    config.ip[i] = (uint8_t)ipStr[i];
-  }
-  config.ip[strlen(ipStr) < 16 ? strlen(ipStr) : 15] = 0;
-  
-  for (int i = 0; i < strlen(gatewayStr) && i < 16; i++) {
-    config.gateway[i] = (uint8_t)gatewayStr[i];
-  }
-  config.gateway[strlen(gatewayStr) < 16 ? strlen(gatewayStr) : 15] = 0;
-  
-  for (int i = 0; i < strlen(subnetStr) && i < 16; i++) {
-    config.subnet[i] = (uint8_t)subnetStr[i];
-  }
-  config.subnet[strlen(subnetStr) < 16 ? strlen(subnetStr) : 15] = 0;
+  networkConfig.gateway[0] = 192;
+  networkConfig.gateway[1] = 168;
+  networkConfig.gateway[2] = 1;
+  networkConfig.gateway[3] = 1;
   
   // Save configuration
-  bool result = mockSaveNetworkConfig(NETWORK_CONFIG_FILE, &config);
+  saveNetworkConfig();
   
-  // Verify save was successful
-  assertTrue(result);
+  // Load configuration
+  loadNetworkConfig();
   
-  // Verify configuration is static
-  assertFalse(config.dhcp);
+  // Verify values
+  assertEqual(networkConfig.dhcp_enabled, false);
+  assertEqual(networkConfig.ip[0], 192);
+  assertEqual(networkConfig.ip[1], 168);
+  assertEqual(networkConfig.ip[2], 1);
+  assertEqual(networkConfig.ip[3], 100);
   
-  // Convert uint8_t arrays to char arrays for comparison
-  char ipStrSaved[17];
-  for (int i = 0; i < 16; i++) {
-    ipStrSaved[i] = (char)config.ip[i];
-    if (config.ip[i] == 0) break;
-  }
-  ipStrSaved[16] = 0;
-  
-  // Verify IP address
-  assertEqual(strcmp(ipStrSaved, "192.168.1.200"), 0);
+  assertEqual(networkConfig.gateway[0], 192);
+  assertEqual(networkConfig.gateway[1], 168);
+  assertEqual(networkConfig.gateway[2], 1);
+  assertEqual(networkConfig.gateway[3], 1);
 }
 
-// Test setting DHCP configuration
+// Test DHCP configuration
 test(NetworkConfigDHCP) {
-  // Create a test network configuration
-  TestNetworkConfig config;
-  
-  // Set DHCP configuration
-  config.dhcp = true;
+  // Test setting DHCP
+  networkConfig.dhcp_enabled = true;
   
   // Save configuration
-  bool result = mockSaveNetworkConfig(NETWORK_CONFIG_FILE, &config);
+  saveNetworkConfig();
   
-  // Verify save was successful
-  assertTrue(result);
+  // Load configuration
+  loadNetworkConfig();
   
-  // Verify configuration is DHCP
-  assertTrue(config.dhcp);
+  // Verify values
+  assertEqual(networkConfig.dhcp_enabled, true);
 }
 
-// Test IP address validation
+// Test IP validation
 test(NetworkConfigIPValidation) {
   // Test valid IP addresses
   assertTrue(isValidIP("192.168.1.1"));
   assertTrue(isValidIP("10.0.0.1"));
   assertTrue(isValidIP("172.16.0.1"));
+  assertTrue(isValidIP("255.255.255.255"));
   
   // Test invalid IP addresses
-  assertFalse(isValidIP("256.168.1.1"));  // Value > 255
-  assertFalse(isValidIP("192.168.1"));    // Missing octet
-  assertFalse(isValidIP("192.168.1.1.1")); // Extra octet
-  assertFalse(isValidIP("192.168.1."));   // Trailing dot
-  assertFalse(isValidIP("192.168..1"));   // Empty octet
-  assertFalse(isValidIP("not an ip"));    // Not an IP at all
+  assertFalse(isValidIP("192.168.1"));       // Missing octet
+  assertFalse(isValidIP("192.168.1.256"));   // Octet > 255
+  assertFalse(isValidIP("192.168.1.1.1"));   // Too many octets
+  assertFalse(isValidIP("192.168.1.a"));     // Non-numeric
+  assertFalse(isValidIP(""));                // Empty
+  assertFalse(isValidIP(NULL));              // NULL
 }
 
 #endif // TEST_NETWORK_H

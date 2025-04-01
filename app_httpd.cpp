@@ -1,881 +1,867 @@
-#include <esp_http_server.h>
-#include <esp_timer.h>
-#include <esp_camera.h>
+#include "esp_timer.h"
+#include "esp_http_server.h"
+#include "esp32-hal-ledc.h"
+#include "sdkconfig.h"
 #include <Arduino.h>
-#include "camera_index.h"
+#if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
+#include "esp32-hal-log.h"
+#endif
+#include "utilities.h"
 #include "network_config.h"
 #include "neopixel.h"
 
-// Safe pins for digital output
-const int safe_do_pins[] = {
-  4, 5, 6, 7, 15, 16, 17, 18, 19, 20, 21, 35, 36, 37, 38, 39, 40, 41, 42, 45, 46
-};
+// Array of safe digital output pins
+const int safe_do_pins[] = {4, 5, 6, 7, 15, 16, 17, 18, 19, 20, 21, 35, 36, 37, 38, 39, 40, 41, 42, 45, 46};
+const int num_safe_do_pins = sizeof(safe_do_pins) / sizeof(safe_do_pins[0]);
 
-// Safe pins for digital input
-const int safe_di_pins[] = {
-  4, 5, 6, 7, 15, 16, 17, 18, 19, 20, 21, 35, 36, 37, 38, 39, 40, 41, 42, 45, 46
-};
+// Array of analog input pins
+const int analog_input_pins[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+const int num_analog_input_pins = sizeof(analog_input_pins) / sizeof(analog_input_pins[0]);
 
-// Safe pins for analog output (PWM)
-const int analog_output_pins[] = {
-  4, 5, 6, 7, 15, 16, 17, 18, 19, 20, 21, 35, 36, 37, 38, 39, 40, 41, 42, 45, 46
-};
+// Array of analog output pins (same as digital output pins)
+const int analog_output_pins[] = {4, 5, 6, 7, 15, 16, 17, 18, 19, 20, 21, 35, 36, 37, 38, 39, 40, 41, 42, 45, 46};
+const int num_analog_output_pins = sizeof(analog_output_pins) / sizeof(analog_output_pins[0]);
 
-// Safe pins for analog input (ADC)
-const int analog_input_pins[] = {
-  1, 2, 3, 4, 5, 6, 7, 8, 9, 10
-};
-
-// Pin initialization tracking
+// Track which pins have been initialized
 bool do_pins_initialized[50] = {false};
-bool di_pins_initialized[50] = {false};
 bool ao_pins_initialized[50] = {false};
-bool ai_pins_initialized[50] = {false};
+int ao_pin_channels[50] = {-1};
+int next_pwm_channel = 0;
 
-// Stream content type and boundary definitions
-#define PART_BOUNDARY "123456789000000000000987654321"
-#define _STREAM_CONTENT_TYPE "multipart/x-mixed-replace;boundary=" PART_BOUNDARY
-#define _STREAM_BOUNDARY "\r\n--" PART_BOUNDARY "\r\n"
-#define _STREAM_PART "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n"
+httpd_handle_t web_server = NULL;
 
 // Check if a pin is safe to use
 bool is_pin_safe(int pin) {
-  for (int i = 0; i < sizeof(safe_do_pins) / sizeof(safe_do_pins[0]); i++) {
-    if (safe_do_pins[i] == pin) {
-      return true;
+    for (int i = 0; i < num_safe_do_pins; i++) {
+        if (pin == safe_do_pins[i]) {
+            return true;
+        }
     }
-  }
-  return false;
+    return false;
 }
 
 // Check if a pin is safe for analog input
 bool is_pin_safe_ai(int pin) {
-  for (int i = 0; i < sizeof(analog_input_pins) / sizeof(analog_input_pins[0]); i++) {
-    if (analog_input_pins[i] == pin) {
-      return true;
+    for (int i = 0; i < num_analog_input_pins; i++) {
+        if (pin == analog_input_pins[i]) {
+            return true;
+        }
     }
-  }
-  return false;
+    return false;
 }
 
 // Check if a pin is safe for analog output
 bool is_pin_safe_ao(int pin) {
-  for (int i = 0; i < sizeof(analog_output_pins) / sizeof(analog_output_pins[0]); i++) {
-    if (analog_output_pins[i] == pin) {
-      return true;
+    for (int i = 0; i < num_analog_output_pins; i++) {
+        if (pin == analog_output_pins[i]) {
+            return true;
+        }
     }
-  }
-  return false;
+    return false;
 }
 
-// JPEG HTTP stream handler
-typedef struct {
-    httpd_req_t *req;
-    size_t len;
-} jpg_chunking_t;
-
-static size_t jpg_encode_stream(void *arg, size_t index, const void *data, size_t len) {
-    jpg_chunking_t *j = (jpg_chunking_t *)arg;
-    if (!index) {
-        j->len = 0;
-    }
-    if (httpd_resp_send_chunk(j->req, (const char *)data, len) != ESP_OK) {
+// Initialize a digital output pin
+int initDigitalOutput(int pin) {
+    if (!is_pin_safe(pin)) {
         return 0;
     }
-    j->len += len;
-    return len;
-}
-
-static esp_err_t capture_handler(httpd_req_t *req){
-    camera_fb_t * fb = NULL;
-    esp_err_t res = ESP_OK;
-    int64_t fr_start = esp_timer_get_time();
-
-    fb = esp_camera_fb_get();
-    if (!fb) {
-        Serial.println("Camera capture failed");
-        httpd_resp_send_500(req);
-        return ESP_FAIL;
-    }
-
-    httpd_resp_set_type(req, "image/jpeg");
-    httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-
-    size_t fb_len = 0;
-    if(fb->format == PIXFORMAT_JPEG){
-        fb_len = fb->len;
-        res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-    } else {
-        jpg_chunking_t jchunk = {req, 0};
-        res = frame2jpg_cb(fb, 80, jpg_encode_stream, &jchunk)?ESP_OK:ESP_FAIL;
-        httpd_resp_send_chunk(req, NULL, 0);
-        fb_len = jchunk.len;
-    }
-    esp_camera_fb_return(fb);
-    int64_t fr_end = esp_timer_get_time();
-    Serial.printf("JPG: %uB %ums\n", (uint32_t)(fb_len), (uint32_t)((fr_end - fr_start)/1000));
-    return res;
-}
-
-static esp_err_t stream_handler(httpd_req_t *req){
-    camera_fb_t * fb = NULL;
-    esp_err_t res = ESP_OK;
-    size_t _jpg_buf_len = 0;
-    uint8_t * _jpg_buf = NULL;
-    char * part_buf[64];
     
-    static int64_t last_frame = 0;
-    if(!last_frame) {
-        last_frame = esp_timer_get_time();
+    if (!do_pins_initialized[pin]) {
+        pinMode(pin, OUTPUT);
+        do_pins_initialized[pin] = true;
     }
-
-    res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
-    if(res != ESP_OK){
-        return res;
-    }
-
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-
-    while(true){
-        fb = esp_camera_fb_get();
-        if (!fb) {
-            Serial.println("Camera capture failed");
-            res = ESP_FAIL;
-        } else {
-            if(fb->format != PIXFORMAT_JPEG){
-                bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
-                esp_camera_fb_return(fb);
-                fb = NULL;
-                if(!jpeg_converted){
-                    Serial.println("JPEG compression failed");
-                    res = ESP_FAIL;
-                }
-            } else {
-                _jpg_buf_len = fb->len;
-                _jpg_buf = fb->buf;
-            }
-        }
-        if(res == ESP_OK){
-            size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
-            res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-        }
-        if(res == ESP_OK){
-            res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
-        }
-        if(res == ESP_OK){
-            res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-        }
-        if(fb){
-            esp_camera_fb_return(fb);
-            fb = NULL;
-            _jpg_buf = NULL;
-        } else if(_jpg_buf){
-            free(_jpg_buf);
-            _jpg_buf = NULL;
-        }
-        if(res != ESP_OK){
-            break;
-        }
-        int64_t fr_end = esp_timer_get_time();
-        int64_t frame_time = fr_end - last_frame;
-        last_frame = fr_end;
-        frame_time /= 1000;
-        Serial.printf("MJPG: %uB %ums (%.1ffps)\n",
-            (uint32_t)(_jpg_buf_len),
-            (uint32_t)frame_time, 1000.0 / (uint32_t)frame_time);
-    }
-
-    last_frame = 0;
-    return res;
+    
+    return 1;
 }
 
-static esp_err_t cmd_handler(httpd_req_t *req){
-    char*  buf;
-    size_t buf_len;
-    char variable[32] = {0,};
-    char value[32] = {0,};
+// Set a digital output pin
+int setDigitalOutput(int pin, int value) {
+    if (!is_pin_safe(pin)) {
+        return 0;
+    }
+    
+    if (!do_pins_initialized[pin]) {
+        if (initDigitalOutput(pin) == 0) {
+            return 0;
+        }
+    }
+    
+    digitalWrite(pin, value);
+    return 1;
+}
 
+// Read from an analog input pin
+int readAnalogInput(int pin) {
+    if (!is_pin_safe_ai(pin)) {
+        return -1;
+    }
+    
+    return analogRead(pin);
+}
+
+// Set an analog output (PWM) pin
+int setAnalogOutput(int pin, int value) {
+    if (!is_pin_safe_ao(pin)) {
+        return 0;
+    }
+    
+    if (!ao_pins_initialized[pin]) {
+        if (next_pwm_channel >= 16) {
+            // All PWM channels are in use
+            return 0;
+        }
+        
+        // Configure PWM for this pin using Arduino's analogWrite
+        pinMode(pin, OUTPUT);
+        ao_pin_channels[pin] = next_pwm_channel;
+        ao_pins_initialized[pin] = true;
+        next_pwm_channel++;
+    }
+    
+    // Write the value to the pin using analogWrite
+    analogWrite(pin, value);
+    return 1;
+}
+
+// Handler for index page
+static esp_err_t index_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Content-Encoding", "identity");
+    
+    // Simple HTML page
+    const char* html = "<!DOCTYPE html>"
+                       "<html>"
+                       "<head>"
+                       "<meta charset=\"utf-8\">"
+                       "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                       "<title>ESP32-S3-ETH Control</title>"
+                       "<style>"
+                       "body{font-family:Arial,Helvetica,sans-serif;background:#f2f2f2;margin:0;padding:20px;color:#333;text-align:center}"
+                       "h1{color:#0066cc;margin-bottom:20px}"
+                       ".container{max-width:800px;margin:0 auto;background:white;padding:20px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}"
+                       ".section{margin-bottom:30px;padding:15px;background:#f9f9f9;border-radius:5px}"
+                       "h2{color:#0099cc;margin-top:0}"
+                       "button{background:#0099cc;color:white;border:none;padding:10px 15px;border-radius:5px;cursor:pointer;margin:5px}"
+                       "button:hover{background:#0077aa}"
+                       "input{padding:8px;margin:5px;border:1px solid #ddd;border-radius:4px}"
+                       ".status{margin-top:10px;font-style:italic;color:#666}"
+                       "</style>"
+                       "</head>"
+                       "<body>"
+                       "<div class=\"container\">"
+                       "<h1>ESP32-S3-ETH Control Panel</h1>"
+                       
+                       "<div class=\"section\">"
+                       "<h2>GPIO Control</h2>"
+                       "<div>"
+                       "<label for=\"pin\">Pin:</label>"
+                       "<input type=\"number\" id=\"pin\" min=\"0\" max=\"48\">"
+                       "<button onclick=\"setHigh()\">Set HIGH</button>"
+                       "<button onclick=\"setLow()\">Set LOW</button>"
+                       "</div>"
+                       "<div class=\"status\" id=\"gpio-status\"></div>"
+                       "</div>"
+                       
+                       "<div class=\"section\">"
+                       "<h2>Analog Input</h2>"
+                       "<div>"
+                       "<label for=\"ai-pin\">Pin:</label>"
+                       "<input type=\"number\" id=\"ai-pin\" min=\"1\" max=\"10\">"
+                       "<button onclick=\"readAnalog()\">Read Value</button>"
+                       "</div>"
+                       "<div class=\"status\" id=\"ai-status\"></div>"
+                       "</div>"
+                       
+                       "<div class=\"section\">"
+                       "<h2>Analog Output (PWM)</h2>"
+                       "<div>"
+                       "<label for=\"ao-pin\">Pin:</label>"
+                       "<input type=\"number\" id=\"ao-pin\" min=\"0\" max=\"48\">"
+                       "<label for=\"ao-value\">Value (0-255):</label>"
+                       "<input type=\"number\" id=\"ao-value\" min=\"0\" max=\"255\" value=\"128\">"
+                       "<button onclick=\"setPWM()\">Set PWM</button>"
+                       "</div>"
+                       "<div class=\"status\" id=\"ao-status\"></div>"
+                       "</div>"
+                       
+                       "<div class=\"section\">"
+                       "<h2>NeoPixel Control</h2>"
+                       "<div>"
+                       "<label for=\"red\">Red (0-255):</label>"
+                       "<input type=\"number\" id=\"red\" min=\"0\" max=\"255\" value=\"0\">"
+                       "<label for=\"green\">Green (0-255):</label>"
+                       "<input type=\"number\" id=\"green\" min=\"0\" max=\"255\" value=\"0\">"
+                       "<label for=\"blue\">Blue (0-255):</label>"
+                       "<input type=\"number\" id=\"blue\" min=\"0\" max=\"255\" value=\"0\">"
+                       "<button onclick=\"setNeoPixel()\">Set Color</button>"
+                       "<button onclick=\"turnOffNeoPixel()\">Turn Off</button>"
+                       "</div>"
+                       "<div class=\"status\" id=\"neopixel-status\"></div>"
+                       "</div>"
+                       
+                       "<div class=\"section\">"
+                       "<h2>Network Configuration</h2>"
+                       "<div id=\"network-info\">Loading...</div>"
+                       "<button onclick=\"getNetworkConfig()\">Refresh</button>"
+                       "</div>"
+                       
+                       "</div>"
+                       
+                       "<script>"
+                       "function setHigh() {"
+                       "  const pin = document.getElementById('pin').value;"
+                       "  fetch(`/gpio/do?pin=${pin}&state=high`)"
+                       "    .then(response => response.text())"
+                       "    .then(data => {"
+                       "      document.getElementById('gpio-status').innerText = data;"
+                       "    });"
+                       "}"
+                       
+                       "function setLow() {"
+                       "  const pin = document.getElementById('pin').value;"
+                       "  fetch(`/gpio/do?pin=${pin}&state=low`)"
+                       "    .then(response => response.text())"
+                       "    .then(data => {"
+                       "      document.getElementById('gpio-status').innerText = data;"
+                       "    });"
+                       "}"
+                       
+                       "function readAnalog() {"
+                       "  const pin = document.getElementById('ai-pin').value;"
+                       "  fetch(`/gpio/ai/read?pin=${pin}`)"
+                       "    .then(response => response.text())"
+                       "    .then(data => {"
+                       "      document.getElementById('ai-status').innerText = data;"
+                       "    });"
+                       "}"
+                       
+                       "function setPWM() {"
+                       "  const pin = document.getElementById('ao-pin').value;"
+                       "  const value = document.getElementById('ao-value').value;"
+                       "  fetch(`/gpio/ao/set?pin=${pin}&value=${value}`)"
+                       "    .then(response => response.text())"
+                       "    .then(data => {"
+                       "      document.getElementById('ao-status').innerText = data;"
+                       "    });"
+                       "}"
+                       
+                       "function setNeoPixel() {"
+                       "  const r = document.getElementById('red').value;"
+                       "  const g = document.getElementById('green').value;"
+                       "  const b = document.getElementById('blue').value;"
+                       "  fetch(`/neopixel/set?r=${r}&g=${g}&b=${b}`)"
+                       "    .then(response => response.text())"
+                       "    .then(data => {"
+                       "      document.getElementById('neopixel-status').innerText = data;"
+                       "    });"
+                       "}"
+                       
+                       "function turnOffNeoPixel() {"
+                       "  fetch('/neopixel/off')"
+                       "    .then(response => response.text())"
+                       "    .then(data => {"
+                       "      document.getElementById('neopixel-status').innerText = data;"
+                       "    });"
+                       "}"
+                       
+                       "function getNetworkConfig() {"
+                       "  fetch('/network/config/get')"
+                       "    .then(response => response.json())"
+                       "    .then(data => {"
+                       "      let html = `<p>DHCP: ${data.dhcp_enabled ? 'Enabled' : 'Disabled'}</p>`;"
+                       "      html += `<p>IP: ${data.ip.join('.')}</p>`;"
+                       "      html += `<p>Gateway: ${data.gateway.join('.')}</p>`;"
+                       "      html += `<p>Subnet: ${data.subnet.join('.')}</p>`;"
+                       "      html += `<p>DNS1: ${data.dns1.join('.')}</p>`;"
+                       "      html += `<p>DNS2: ${data.dns2.join('.')}</p>`;"
+                       "      html += `<p>Hostname: ${data.hostname}</p>`;"
+                       "      document.getElementById('network-info').innerHTML = html;"
+                       "    });"
+                       "}"
+                       
+                       "// Load network config on page load"
+                       "getNetworkConfig();"
+                       "</script>"
+                       "</body>"
+                       "</html>";
+    
+    return httpd_resp_send(req, html, strlen(html));
+}
+
+// Handler for digital output control
+static esp_err_t gpio_do_handler(httpd_req_t *req) {
+    char *buf;
+    size_t buf_len;
+    char pin_str[8] = {0};
+    char state_str[8] = {0};
+    
     buf_len = httpd_req_get_url_query_len(req) + 1;
     if (buf_len > 1) {
-        buf = (char*)malloc(buf_len);
-        if(!buf){
+        buf = (char *)malloc(buf_len);
+        if (!buf) {
             httpd_resp_send_500(req);
             return ESP_FAIL;
         }
+        
         if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
-            if (httpd_query_key_value(buf, "var", variable, sizeof(variable)) == ESP_OK &&
-                httpd_query_key_value(buf, "val", value, sizeof(value)) == ESP_OK) {
-            } else {
-                free(buf);
-                httpd_resp_send_404(req);
-                return ESP_FAIL;
+            if (httpd_query_key_value(buf, "pin", pin_str, sizeof(pin_str)) == ESP_OK &&
+                httpd_query_key_value(buf, "state", state_str, sizeof(state_str)) == ESP_OK) {
+                
+                int pin = atoi(pin_str);
+                int state = (strcmp(state_str, "high") == 0) ? HIGH : LOW;
+                
+                int result = setDigitalOutput(pin, state);
+                
+                char resp[64];
+                if (result) {
+                    sprintf(resp, "Pin %d set to %s", pin, state_str);
+                } else {
+                    sprintf(resp, "Error: Pin %d is not valid for digital output", pin);
+                }
+                
+                httpd_resp_set_type(req, "text/plain");
+                httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+                return httpd_resp_send(req, resp, strlen(resp));
             }
-        } else {
-            free(buf);
-            httpd_resp_send_404(req);
+        }
+        
+        free(buf);
+    }
+    
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+}
+
+// Handler for multiple digital outputs
+static esp_err_t gpio_do_all_handler(httpd_req_t *req) {
+    char *buf;
+    size_t buf_len;
+    char pins_str[64] = {0};
+    char states_str[64] = {0};
+    
+    buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        buf = (char *)malloc(buf_len);
+        if (!buf) {
+            httpd_resp_send_500(req);
             return ESP_FAIL;
         }
+        
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            if (httpd_query_key_value(buf, "pins", pins_str, sizeof(pins_str)) == ESP_OK &&
+                httpd_query_key_value(buf, "states", states_str, sizeof(states_str)) == ESP_OK) {
+                
+                // Make copies for strtok
+                char pins_copy[64];
+                char states_copy[64];
+                strcpy(pins_copy, pins_str);
+                strcpy(states_copy, states_str);
+                
+                // Parse pins and states
+                char *pin_token = strtok(pins_copy, ",");
+                char *state_token = strtok(states_copy, ",");
+                
+                int success_count = 0;
+                int fail_count = 0;
+                
+                while (pin_token != NULL && state_token != NULL) {
+                    int pin = atoi(pin_token);
+                    int state = (strcmp(state_token, "high") == 0) ? HIGH : LOW;
+                    
+                    int result = setDigitalOutput(pin, state);
+                    if (result) {
+                        success_count++;
+                    } else {
+                        fail_count++;
+                    }
+                    
+                    pin_token = strtok(NULL, ",");
+                    state_token = strtok(NULL, ",");
+                }
+                
+                char resp[64];
+                sprintf(resp, "Set %d pins successfully, %d failed", success_count, fail_count);
+                
+                httpd_resp_set_type(req, "text/plain");
+                httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+                return httpd_resp_send(req, resp, strlen(resp));
+            }
+        }
+        
         free(buf);
-    } else {
-        httpd_resp_send_404(req);
+    }
+    
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+}
+
+// Handler for analog input reading
+static esp_err_t gpio_ai_read_handler(httpd_req_t *req) {
+    char *buf;
+    size_t buf_len;
+    char pin_str[8] = {0};
+    
+    buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        buf = (char *)malloc(buf_len);
+        if (!buf) {
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            if (httpd_query_key_value(buf, "pin", pin_str, sizeof(pin_str)) == ESP_OK) {
+                
+                int pin = atoi(pin_str);
+                int value = readAnalogInput(pin);
+                
+                char resp[64];
+                if (value >= 0) {
+                    sprintf(resp, "Pin %d analog value: %d", pin, value);
+                } else {
+                    sprintf(resp, "Error: Pin %d is not valid for analog input", pin);
+                }
+                
+                httpd_resp_set_type(req, "text/plain");
+                httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+                return httpd_resp_send(req, resp, strlen(resp));
+            }
+        }
+        
+        free(buf);
+    }
+    
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+}
+
+// Handler for analog output (PWM) setting
+static esp_err_t gpio_ao_set_handler(httpd_req_t *req) {
+    char *buf;
+    size_t buf_len;
+    char pin_str[8] = {0};
+    char value_str[8] = {0};
+    
+    buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        buf = (char *)malloc(buf_len);
+        if (!buf) {
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            if (httpd_query_key_value(buf, "pin", pin_str, sizeof(pin_str)) == ESP_OK &&
+                httpd_query_key_value(buf, "value", value_str, sizeof(value_str)) == ESP_OK) {
+                
+                int pin = atoi(pin_str);
+                int value = atoi(value_str);
+                
+                // Ensure value is in range 0-255
+                if (value < 0) value = 0;
+                if (value > 255) value = 255;
+                
+                int result = setAnalogOutput(pin, value);
+                
+                char resp[64];
+                if (result) {
+                    sprintf(resp, "Pin %d PWM value set to %d", pin, value);
+                } else {
+                    sprintf(resp, "Error: Pin %d is not valid for analog output", pin);
+                }
+                
+                httpd_resp_set_type(req, "text/plain");
+                httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+                return httpd_resp_send(req, resp, strlen(resp));
+            }
+        }
+        
+        free(buf);
+    }
+    
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+}
+
+// Handler for GPIO overview
+static esp_err_t gpio_overview_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    
+    // Create a JSON response with GPIO information
+    char *resp = (char *)malloc(4096);
+    if (!resp) {
+        httpd_resp_send_500(req);
         return ESP_FAIL;
     }
-
-    int val = atoi(value);
-    sensor_t * s = esp_camera_sensor_get();
-    int res = 0;
-
-    if(!strcmp(variable, "framesize")) {
-        if(s->pixformat == PIXFORMAT_JPEG) res = s->set_framesize(s, (framesize_t)val);
-    }
-    else if(!strcmp(variable, "quality")) res = s->set_quality(s, val);
-    else if(!strcmp(variable, "contrast")) res = s->set_contrast(s, val);
-    else if(!strcmp(variable, "brightness")) res = s->set_brightness(s, val);
-    else if(!strcmp(variable, "saturation")) res = s->set_saturation(s, val);
-    else if(!strcmp(variable, "gainceiling")) res = s->set_gainceiling(s, (gainceiling_t)val);
-    else if(!strcmp(variable, "colorbar")) res = s->set_colorbar(s, val);
-    else if(!strcmp(variable, "awb")) res = s->set_whitebal(s, val);
-    else if(!strcmp(variable, "agc")) res = s->set_gain_ctrl(s, val);
-    else if(!strcmp(variable, "aec")) res = s->set_exposure_ctrl(s, val);
-    else if(!strcmp(variable, "hmirror")) res = s->set_hmirror(s, val);
-    else if(!strcmp(variable, "vflip")) res = s->set_vflip(s, val);
-    else if(!strcmp(variable, "awb_gain")) res = s->set_awb_gain(s, val);
-    else if(!strcmp(variable, "agc_gain")) res = s->set_agc_gain(s, val);
-    else if(!strcmp(variable, "aec_value")) res = s->set_aec_value(s, val);
-    else if(!strcmp(variable, "aec2")) res = s->set_aec2(s, val);
-    else if(!strcmp(variable, "dcw")) res = s->set_dcw(s, val);
-    else if(!strcmp(variable, "bpc")) res = s->set_bpc(s, val);
-    else if(!strcmp(variable, "wpc")) res = s->set_wpc(s, val);
-    else if(!strcmp(variable, "raw_gma")) res = s->set_raw_gma(s, val);
-    else if(!strcmp(variable, "lenc")) res = s->set_lenc(s, val);
-    else if(!strcmp(variable, "special_effect")) res = s->set_special_effect(s, val);
-    else if(!strcmp(variable, "wb_mode")) res = s->set_wb_mode(s, val);
-    else if(!strcmp(variable, "ae_level")) res = s->set_ae_level(s, val);
-    else {
-        res = -1;
-    }
-
-    if(res){
-        return httpd_resp_send_500(req);
-    }
-
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    return httpd_resp_send(req, NULL, 0);
-}
-
-static esp_err_t status_handler(httpd_req_t *req){
-    static char json_response[1024];
-
-    sensor_t * s = esp_camera_sensor_get();
-    char * p = json_response;
-    *p++ = '{';
-
-    p+=sprintf(p, "\"framesize\":%u,", s->status.framesize);
-    p+=sprintf(p, "\"quality\":%u,", s->status.quality);
-    p+=sprintf(p, "\"brightness\":%d,", s->status.brightness);
-    p+=sprintf(p, "\"contrast\":%d,", s->status.contrast);
-    p+=sprintf(p, "\"saturation\":%d,", s->status.saturation);
-    p+=sprintf(p, "\"sharpness\":%d,", s->status.sharpness);
-    p+=sprintf(p, "\"special_effect\":%u,", s->status.special_effect);
-    p+=sprintf(p, "\"wb_mode\":%u,", s->status.wb_mode);
-    p+=sprintf(p, "\"awb\":%u,", s->status.awb);
-    p+=sprintf(p, "\"awb_gain\":%u,", s->status.awb_gain);
-    p+=sprintf(p, "\"aec\":%u,", s->status.aec);
-    p+=sprintf(p, "\"aec2\":%u,", s->status.aec2);
-    p+=sprintf(p, "\"ae_level\":%d,", s->status.ae_level);
-    p+=sprintf(p, "\"aec_value\":%u,", s->status.aec_value);
-    p+=sprintf(p, "\"agc\":%u,", s->status.agc);
-    p+=sprintf(p, "\"agc_gain\":%u,", s->status.agc_gain);
-    p+=sprintf(p, "\"gainceiling\":%u,", s->status.gainceiling);
-    p+=sprintf(p, "\"bpc\":%u,", s->status.bpc);
-    p+=sprintf(p, "\"wpc\":%u,", s->status.wpc);
-    p+=sprintf(p, "\"raw_gma\":%u,", s->status.raw_gma);
-    p+=sprintf(p, "\"lenc\":%u,", s->status.lenc);
-    p+=sprintf(p, "\"vflip\":%u,", s->status.vflip);
-    p+=sprintf(p, "\"hmirror\":%u,", s->status.hmirror);
-    p+=sprintf(p, "\"dcw\":%u,", s->status.dcw);
-    p+=sprintf(p, "\"colorbar\":%u", s->status.colorbar);
-
-    *p++ = '}';
-    *p++ = 0;
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    return httpd_resp_send(req, json_response, strlen(json_response));
-}
-
-static esp_err_t index_handler(httpd_req_t *req){
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
-    return httpd_resp_send(req, (const char *)index_ov2640_html_gz, index_ov2640_html_gz_len);
-}
-
-// Handler for setting digital output
-static esp_err_t gpio_do_handler(httpd_req_t *req)
-{
-  char query[256];
-  char param[32];
-  
-  // Get query parameters
-  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
-    httpd_resp_send_404(req);
-    return ESP_FAIL;
-  }
-  
-  // Debug output
-  Serial.print("GPIO do query: ");
-  Serial.println(query);
-  
-  // Extract pin
-  if (httpd_query_key_value(query, "pin", param, sizeof(param)) != ESP_OK) {
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    char response[128];
-    sprintf(response, "{\"error\":\"Missing pin parameter\",\"success\":false}");
-    return httpd_resp_send(req, response, strlen(response));
-  }
-  
-  int pin = atoi(param);
-  
-  // Check if pin is safe to use
-  if (!is_pin_safe(pin)) {
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    char response[128];
-    sprintf(response, "{\"error\":\"Pin not safe to use\",\"success\":false}");
-    return httpd_resp_send(req, response, strlen(response));
-  }
-  
-  // Extract state
-  if (httpd_query_key_value(query, "state", param, sizeof(param)) != ESP_OK) {
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    char response[128];
-    sprintf(response, "{\"error\":\"Missing state parameter\",\"success\":false}");
-    return httpd_resp_send(req, response, strlen(response));
-  }
-  
-  // Initialize pin if not already initialized
-  if (!do_pins_initialized[pin]) {
-    pinMode(pin, OUTPUT);
-    do_pins_initialized[pin] = true;
     
-    // If this pin was previously used for PWM, release the channel
-    if (ao_pins_initialized[pin]) {
-      ledcDetach(pin);
-      ao_pins_initialized[pin] = false;
-    }
-  }
-  
-  // Set pin state
-  bool state = false;
-  if (strcmp(param, "high") == 0 || strcmp(param, "1") == 0 || strcmp(param, "true") == 0) {
-    state = true;
-    digitalWrite(pin, HIGH);
-  } else {
-    digitalWrite(pin, LOW);
-  }
-  
-  // Send response
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  char response[128];
-  sprintf(response, "{\"pin\":%d,\"state\":\"%s\",\"success\":true}", pin, state ? "high" : "low");
-  return httpd_resp_send(req, response, strlen(response));
-}
-
-// Handler for reading analog input
-static esp_err_t gpio_ai_read_handler(httpd_req_t *req)
-{
-  char query[256];
-  char param[32];
-  
-  // Get query parameters
-  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
-    httpd_resp_send_404(req);
-    return ESP_FAIL;
-  }
-  
-  // Extract pin
-  if (httpd_query_key_value(query, "pin", param, sizeof(param)) != ESP_OK) {
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    char response[128];
-    sprintf(response, "{\"error\":\"Missing pin parameter\",\"success\":false}");
-    return httpd_resp_send(req, response, strlen(response));
-  }
-  
-  int pin = atoi(param);
-  
-  // Check if pin is safe to use for analog input
-  if (!is_pin_safe_ai(pin)) {
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    char response[128];
-    sprintf(response, "{\"error\":\"Pin not safe for analog input\",\"success\":false}");
-    return httpd_resp_send(req, response, strlen(response));
-  }
-  
-  // Initialize pin if not already initialized
-  if (!ai_pins_initialized[pin]) {
-    pinMode(pin, INPUT);
-    ai_pins_initialized[pin] = true;
-  }
-  
-  // Read analog value
-  int value = analogRead(pin);
-  
-  // Send response
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  char response[128];
-  sprintf(response, "{\"pin\":%d,\"value\":%d,\"success\":true}", pin, value);
-  return httpd_resp_send(req, response, strlen(response));
-}
-
-// Handler for setting analog output (PWM)
-static esp_err_t gpio_ao_set_handler(httpd_req_t *req)
-{
-  char query[256];
-  char param[32];
-  
-  // Get query parameters
-  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
-    httpd_resp_send_404(req);
-    return ESP_FAIL;
-  }
-  
-  // Extract pin
-  if (httpd_query_key_value(query, "pin", param, sizeof(param)) != ESP_OK) {
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    char response[128];
-    sprintf(response, "{\"error\":\"Missing pin parameter\",\"success\":false}");
-    return httpd_resp_send(req, response, strlen(response));
-  }
-  
-  int pin = atoi(param);
-  
-  // Check if pin is safe to use for analog output
-  if (!is_pin_safe_ao(pin)) {
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    char response[128];
-    sprintf(response, "{\"error\":\"Pin not safe for analog output\",\"success\":false}");
-    return httpd_resp_send(req, response, strlen(response));
-  }
-  
-  // Extract value
-  if (httpd_query_key_value(query, "value", param, sizeof(param)) != ESP_OK) {
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    char response[128];
-    sprintf(response, "{\"error\":\"Missing value parameter\",\"success\":false}");
-    return httpd_resp_send(req, response, strlen(response));
-  }
-  
-  int value = atoi(param);
-  if (value < 0) value = 0;
-  if (value > 255) value = 255;
-  
-  // Initialize pin if not already initialized
-  if (!ao_pins_initialized[pin]) {
-    // If this pin was previously used for digital output, we need to reconfigure
-    if (do_pins_initialized[pin]) {
-      do_pins_initialized[pin] = false;
-    }
+    int len = 0;
+    len += sprintf(resp + len, "{\n");
+    len += sprintf(resp + len, "  \"safe_digital_pins\": [");
     
-    // Configure PWM
-    ledcAttach(pin, 5000, 8); // 5kHz, 8-bit resolution
-    ao_pins_initialized[pin] = true;
-  }
-  
-  // Set PWM value
-  ledcWrite(pin, value);
-  
-  // Send response
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  char response[128];
-  sprintf(response, "{\"pin\":%d,\"value\":%d,\"success\":true}", pin, value);
-  return httpd_resp_send(req, response, strlen(response));
-}
-
-// Handler for setting multiple digital outputs
-static esp_err_t gpio_do_all_handler(httpd_req_t *req)
-{
-  char query[256];
-  char pins_str[128];
-  char states_str[128];
-  
-  // Get query parameters
-  if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
-    httpd_resp_send_404(req);
-    return ESP_FAIL;
-  }
-  
-  // Debug output
-  Serial.print("GPIO do_all query: ");
-  Serial.println(query);
-  
-  // Extract pins
-  if (httpd_query_key_value(query, "pins", pins_str, sizeof(pins_str)) != ESP_OK) {
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    char response[128];
-    sprintf(response, "{\"error\":\"Missing pins parameter\",\"success\":false}");
-    return httpd_resp_send(req, response, strlen(response));
-  }
-  
-  // Extract states
-  if (httpd_query_key_value(query, "states", states_str, sizeof(states_str)) != ESP_OK) {
-    httpd_resp_set_type(req, "application/json");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    char response[128];
-    sprintf(response, "{\"error\":\"Missing states parameter\",\"success\":false}");
-    return httpd_resp_send(req, response, strlen(response));
-  }
-  
-  // Parse pins and states
-  char *pins_token = strtok(pins_str, ",");
-  char *states_token = strtok(states_str, ",");
-  
-  // Prepare response
-  char response[512] = "{\"results\":[";
-  bool first = true;
-  
-  // Process each pin and state
-  while (pins_token != NULL && states_token != NULL) {
-    int pin = atoi(pins_token);
-    bool state = false;
-    
-    // Check if pin is safe to use
-    if (is_pin_safe(pin)) {
-      // Initialize pin if not already initialized
-      if (!do_pins_initialized[pin]) {
-        pinMode(pin, OUTPUT);
-        do_pins_initialized[pin] = true;
-        
-        // If this pin was previously used for PWM, release the channel
-        if (ao_pins_initialized[pin]) {
-          ledcDetach(pin);
-          ao_pins_initialized[pin] = false;
+    for (int i = 0; i < num_safe_do_pins; i++) {
+        len += sprintf(resp + len, "%d", safe_do_pins[i]);
+        if (i < num_safe_do_pins - 1) {
+            len += sprintf(resp + len, ", ");
         }
-      }
-      
-      // Set pin state
-      if (strcmp(states_token, "high") == 0 || strcmp(states_token, "1") == 0 || strcmp(states_token, "true") == 0) {
-        state = true;
-        digitalWrite(pin, HIGH);
-      } else {
-        digitalWrite(pin, LOW);
-      }
-      
-      // Add to response
-      char pin_result[128];
-      sprintf(pin_result, "%s{\"pin\":%d,\"state\":\"%s\",\"success\":true}", 
-              first ? "" : ",", pin, state ? "high" : "low");
-      strcat(response, pin_result);
-      first = false;
-    } else {
-      // Pin not safe, add error to response
-      char pin_result[128];
-      sprintf(pin_result, "%s{\"pin\":%d,\"error\":\"Pin not safe to use\",\"success\":false}", 
-              first ? "" : ",", pin);
-      strcat(response, pin_result);
-      first = false;
     }
     
-    // Get next tokens
-    pins_token = strtok(NULL, ",");
-    states_token = strtok(NULL, ",");
-  }
-  
-  // Complete response
-  strcat(response, "]}");
-  
-  // Send response
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  return httpd_resp_send(req, response, strlen(response));
+    len += sprintf(resp + len, "],\n");
+    len += sprintf(resp + len, "  \"analog_input_pins\": [");
+    
+    for (int i = 0; i < num_analog_input_pins; i++) {
+        len += sprintf(resp + len, "%d", analog_input_pins[i]);
+        if (i < num_analog_input_pins - 1) {
+            len += sprintf(resp + len, ", ");
+        }
+    }
+    
+    len += sprintf(resp + len, "],\n");
+    len += sprintf(resp + len, "  \"analog_output_pins\": [");
+    
+    for (int i = 0; i < num_analog_output_pins; i++) {
+        len += sprintf(resp + len, "%d", analog_output_pins[i]);
+        if (i < num_analog_output_pins - 1) {
+            len += sprintf(resp + len, ", ");
+        }
+    }
+    
+    len += sprintf(resp + len, "],\n");
+    len += sprintf(resp + len, "  \"initialized_pins\": [");
+    
+    bool first = true;
+    for (int i = 0; i < 50; i++) {
+        if (do_pins_initialized[i] || ao_pins_initialized[i]) {
+            if (!first) {
+                len += sprintf(resp + len, ", ");
+            }
+            len += sprintf(resp + len, "%d", i);
+            first = false;
+        }
+    }
+    
+    len += sprintf(resp + len, "]\n");
+    len += sprintf(resp + len, "}\n");
+    
+    httpd_resp_send(req, resp, len);
+    free(resp);
+    return ESP_OK;
 }
 
-// Handler for getting GPIO overview
-static esp_err_t gpio_overview_handler(httpd_req_t *req)
-{
-  // Prepare response
-  char response[1024] = "{";
-  
-  // Add safe digital output pins
-  strcat(response, "\"safe_do_pins\":[");
-  for (int i = 0; i < sizeof(safe_do_pins) / sizeof(safe_do_pins[0]); i++) {
-    char pin_str[8];
-    sprintf(pin_str, "%s%d", i > 0 ? "," : "", safe_do_pins[i]);
-    strcat(response, pin_str);
-  }
-  strcat(response, "],");
-  
-  // Add safe digital input pins
-  strcat(response, "\"safe_di_pins\":[");
-  for (int i = 0; i < sizeof(safe_di_pins) / sizeof(safe_di_pins[0]); i++) {
-    char pin_str[8];
-    sprintf(pin_str, "%s%d", i > 0 ? "," : "", safe_di_pins[i]);
-    strcat(response, pin_str);
-  }
-  strcat(response, "],");
-  
-  // Add safe analog output pins
-  strcat(response, "\"analog_output_pins\":[");
-  for (int i = 0; i < sizeof(analog_output_pins) / sizeof(analog_output_pins[0]); i++) {
-    char pin_str[8];
-    sprintf(pin_str, "%s%d", i > 0 ? "," : "", analog_output_pins[i]);
-    strcat(response, pin_str);
-  }
-  strcat(response, "],");
-  
-  // Add safe analog input pins
-  strcat(response, "\"analog_input_pins\":[");
-  for (int i = 0; i < sizeof(analog_input_pins) / sizeof(analog_input_pins[0]); i++) {
-    char pin_str[8];
-    sprintf(pin_str, "%s%d", i > 0 ? "," : "", analog_input_pins[i]);
-    strcat(response, pin_str);
-  }
-  strcat(response, "],");
-  
-  // Add initialized pins
-  strcat(response, "\"initialized_pins\":{");
-  bool first = true;
-  
-  // Digital output pins
-  for (int i = 0; i < 50; i++) {
-    if (do_pins_initialized[i]) {
-      char pin_str[32];
-      sprintf(pin_str, "%s\"%d\":\"digital_output\"", first ? "" : ",", i);
-      strcat(response, pin_str);
-      first = false;
+// Handler for NeoPixel color setting
+static esp_err_t neopixel_set_handler(httpd_req_t *req) {
+    char *buf;
+    size_t buf_len;
+    char r_str[8] = {0};
+    char g_str[8] = {0};
+    char b_str[8] = {0};
+    
+    buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        buf = (char *)malloc(buf_len);
+        if (!buf) {
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            if (httpd_query_key_value(buf, "r", r_str, sizeof(r_str)) == ESP_OK &&
+                httpd_query_key_value(buf, "g", g_str, sizeof(g_str)) == ESP_OK &&
+                httpd_query_key_value(buf, "b", b_str, sizeof(b_str)) == ESP_OK) {
+                
+                int r = atoi(r_str);
+                int g = atoi(g_str);
+                int b = atoi(b_str);
+                
+                // Ensure values are in range 0-255
+                if (r < 0) r = 0;
+                if (r > 255) r = 255;
+                if (g < 0) g = 0;
+                if (g > 255) g = 255;
+                if (b < 0) b = 0;
+                if (b > 255) b = 255;
+                
+                setNeoPixelColor(r, g, b);
+                
+                char resp[64];
+                sprintf(resp, "NeoPixel color set to RGB(%d, %d, %d)", r, g, b);
+                
+                httpd_resp_set_type(req, "text/plain");
+                httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+                return httpd_resp_send(req, resp, strlen(resp));
+            }
+        }
+        
+        free(buf);
     }
-  }
-  
-  // Digital input pins
-  for (int i = 0; i < 50; i++) {
-    if (di_pins_initialized[i]) {
-      char pin_str[32];
-      sprintf(pin_str, "%s\"%d\":\"digital_input\"", first ? "" : ",", i);
-      strcat(response, pin_str);
-      first = false;
-    }
-  }
-  
-  // Analog output pins
-  for (int i = 0; i < 50; i++) {
-    if (ao_pins_initialized[i]) {
-      char pin_str[32];
-      sprintf(pin_str, "%s\"%d\":\"analog_output\"", first ? "" : ",", i);
-      strcat(response, pin_str);
-      first = false;
-    }
-  }
-  
-  // Analog input pins
-  for (int i = 0; i < 50; i++) {
-    if (ai_pins_initialized[i]) {
-      char pin_str[32];
-      sprintf(pin_str, "%s\"%d\":\"analog_input\"", first ? "" : ",", i);
-      strcat(response, pin_str);
-      first = false;
-    }
-  }
-  
-  strcat(response, "},");
-  
-  // Add pin states
-  strcat(response, "\"pin_states\":{");
-  first = true;
-  
-  // Digital output pins
-  for (int i = 0; i < 50; i++) {
-    if (do_pins_initialized[i]) {
-      char pin_str[32];
-      int state = digitalRead(i);
-      sprintf(pin_str, "%s\"%d\":\"%s\"", first ? "" : ",", i, state ? "high" : "low");
-      strcat(response, pin_str);
-      first = false;
-    }
-  }
-  
-  // Analog output pins
-  for (int i = 0; i < 50; i++) {
-    if (ao_pins_initialized[i]) {
-      char pin_str[32];
-      // We don't have a direct way to read the current PWM value, so we just indicate it's PWM
-      sprintf(pin_str, "%s\"%d\":\"pwm\"", first ? "" : ",", i);
-      strcat(response, pin_str);
-      first = false;
-    }
-  }
-  
-  // Analog input pins
-  for (int i = 0; i < 50; i++) {
-    if (ai_pins_initialized[i] && is_pin_safe_ai(i)) {
-      char pin_str[32];
-      int value = analogRead(i);
-      sprintf(pin_str, "%s\"%d\":%d", first ? "" : ",", i, value);
-      strcat(response, pin_str);
-      first = false;
-    }
-  }
-  
-  strcat(response, "}}");
-  
-  // Send response
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  return httpd_resp_send(req, response, strlen(response));
+    
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
 }
 
-void startCameraServer(){
+// Handler for turning off NeoPixel
+static esp_err_t neopixel_off_handler(httpd_req_t *req) {
+    turnOffNeoPixel();
+    
+    const char *resp = "NeoPixel turned off";
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, resp, strlen(resp));
+}
+
+// Handler for getting network configuration
+static esp_err_t network_config_get_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    
+    char resp[512];
+    int len = 0;
+    
+    len += sprintf(resp + len, "{\n");
+    len += sprintf(resp + len, "  \"dhcp_enabled\": %s,\n", networkConfig.dhcp_enabled ? "true" : "false");
+    
+    len += sprintf(resp + len, "  \"ip\": [%d, %d, %d, %d],\n", 
+                  networkConfig.ip[0], networkConfig.ip[1], networkConfig.ip[2], networkConfig.ip[3]);
+    
+    len += sprintf(resp + len, "  \"gateway\": [%d, %d, %d, %d],\n", 
+                  networkConfig.gateway[0], networkConfig.gateway[1], networkConfig.gateway[2], networkConfig.gateway[3]);
+    
+    len += sprintf(resp + len, "  \"subnet\": [%d, %d, %d, %d],\n", 
+                  networkConfig.subnet[0], networkConfig.subnet[1], networkConfig.subnet[2], networkConfig.subnet[3]);
+    
+    len += sprintf(resp + len, "  \"dns1\": [%d, %d, %d, %d],\n", 
+                  networkConfig.dns1[0], networkConfig.dns1[1], networkConfig.dns1[2], networkConfig.dns1[3]);
+    
+    len += sprintf(resp + len, "  \"dns2\": [%d, %d, %d, %d],\n", 
+                  networkConfig.dns2[0], networkConfig.dns2[1], networkConfig.dns2[2], networkConfig.dns2[3]);
+    
+    len += sprintf(resp + len, "  \"hostname\": \"%s\"\n", networkConfig.hostname);
+    len += sprintf(resp + len, "}\n");
+    
+    return httpd_resp_send(req, resp, len);
+}
+
+// Handler for setting network configuration
+static esp_err_t network_config_set_handler(httpd_req_t *req) {
+    char *buf;
+    size_t buf_len;
+    char dhcp_str[8] = {0};
+    char ip_str[32] = {0};
+    char gateway_str[32] = {0};
+    char subnet_str[32] = {0};
+    char dns1_str[32] = {0};
+    char dns2_str[32] = {0};
+    char hostname_str[32] = {0};
+    char apply_str[8] = {0};
+    
+    buf_len = httpd_req_get_url_query_len(req) + 1;
+    if (buf_len > 1) {
+        buf = (char *)malloc(buf_len);
+        if (!buf) {
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        
+        if (httpd_req_get_url_query_str(req, buf, buf_len) == ESP_OK) {
+            httpd_query_key_value(buf, "dhcp", dhcp_str, sizeof(dhcp_str));
+            httpd_query_key_value(buf, "ip", ip_str, sizeof(ip_str));
+            httpd_query_key_value(buf, "gateway", gateway_str, sizeof(gateway_str));
+            httpd_query_key_value(buf, "subnet", subnet_str, sizeof(subnet_str));
+            httpd_query_key_value(buf, "dns1", dns1_str, sizeof(dns1_str));
+            httpd_query_key_value(buf, "dns2", dns2_str, sizeof(dns2_str));
+            httpd_query_key_value(buf, "hostname", hostname_str, sizeof(hostname_str));
+            httpd_query_key_value(buf, "apply", apply_str, sizeof(apply_str));
+            
+            // Update network configuration
+            if (strlen(dhcp_str) > 0) {
+                networkConfig.dhcp_enabled = (strcmp(dhcp_str, "true") == 0);
+            }
+            
+            if (strlen(ip_str) > 0) {
+                // Parse IP address (format: 192.168.1.100)
+                sscanf(ip_str, "%d.%d.%d.%d", 
+                       &networkConfig.ip[0], &networkConfig.ip[1], 
+                       &networkConfig.ip[2], &networkConfig.ip[3]);
+            }
+            
+            if (strlen(gateway_str) > 0) {
+                sscanf(gateway_str, "%d.%d.%d.%d", 
+                       &networkConfig.gateway[0], &networkConfig.gateway[1], 
+                       &networkConfig.gateway[2], &networkConfig.gateway[3]);
+            }
+            
+            if (strlen(subnet_str) > 0) {
+                sscanf(subnet_str, "%d.%d.%d.%d", 
+                       &networkConfig.subnet[0], &networkConfig.subnet[1], 
+                       &networkConfig.subnet[2], &networkConfig.subnet[3]);
+            }
+            
+            if (strlen(dns1_str) > 0) {
+                sscanf(dns1_str, "%d.%d.%d.%d", 
+                       &networkConfig.dns1[0], &networkConfig.dns1[1], 
+                       &networkConfig.dns1[2], &networkConfig.dns1[3]);
+            }
+            
+            if (strlen(dns2_str) > 0) {
+                sscanf(dns2_str, "%d.%d.%d.%d", 
+                       &networkConfig.dns2[0], &networkConfig.dns2[1], 
+                       &networkConfig.dns2[2], &networkConfig.dns2[3]);
+            }
+            
+            if (strlen(hostname_str) > 0) {
+                strncpy(networkConfig.hostname, hostname_str, sizeof(networkConfig.hostname) - 1);
+            }
+            
+            // Save configuration
+            saveNetworkConfig();
+            
+            // Apply configuration if requested
+            bool apply = (strcmp(apply_str, "true") == 0);
+            
+            char resp[128];
+            if (apply) {
+                sprintf(resp, "Network configuration updated and will be applied on next restart");
+            } else {
+                sprintf(resp, "Network configuration updated");
+            }
+            
+            httpd_resp_set_type(req, "text/plain");
+            httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+            httpd_resp_send(req, resp, strlen(resp));
+            
+            free(buf);
+            
+            // Restart if apply was requested
+            if (apply) {
+                // Wait a moment for the response to be sent
+                delay(1000);
+                ESP.restart();
+            }
+            
+            return ESP_OK;
+        }
+        
+        free(buf);
+    }
+    
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+}
+
+// Handler for restarting the device
+static esp_err_t restart_handler(httpd_req_t *req) {
+    const char *resp = "Restarting device...";
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_send(req, resp, strlen(resp));
+    
+    // Wait a moment for the response to be sent
+    delay(1000);
+    ESP.restart();
+    
+    return ESP_OK;
+}
+
+void startWebServer() {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_uri_handlers = 16;
-
-    httpd_handle_t camera_httpd = NULL;
-
-    // Define URI handlers
-    httpd_uri_t index_uri_def = {
-        .uri       = "/",
-        .method    = HTTP_GET,
-        .handler   = index_handler,
-        .user_ctx  = NULL
-    };
-
-    httpd_uri_t status_uri_def = {
-        .uri       = "/camera/status",
-        .method    = HTTP_GET,
-        .handler   = status_handler,
-        .user_ctx  = NULL
-    };
-
-    httpd_uri_t cmd_uri_def = {
-        .uri       = "/camera/control",
-        .method    = HTTP_GET,
-        .handler   = cmd_handler,
-        .user_ctx  = NULL
-    };
-
-    httpd_uri_t capture_uri_def = {
-        .uri       = "/camera/capture",
-        .method    = HTTP_GET,
-        .handler   = capture_handler,
-        .user_ctx  = NULL
-    };
-
-    httpd_uri_t stream_uri_def = {
-        .uri       = "/camera/stream",
-        .method    = HTTP_GET,
-        .handler   = stream_handler,
-        .user_ctx  = NULL
-    };
-
-    httpd_uri_t gpio_do_uri_def = {
-        .uri       = "/gpio/do",
-        .method    = HTTP_GET,
-        .handler   = gpio_do_handler,
-        .user_ctx  = NULL
-    };
-
-    httpd_uri_t gpio_ai_read_uri_def = {
-        .uri       = "/gpio/ai/read",
-        .method    = HTTP_GET,
-        .handler   = gpio_ai_read_handler,
-        .user_ctx  = NULL
-    };
-
-    httpd_uri_t gpio_ao_set_uri_def = {
-        .uri       = "/gpio/ao/set",
-        .method    = HTTP_GET,
-        .handler   = gpio_ao_set_handler,
-        .user_ctx  = NULL
-    };
-
-    httpd_uri_t gpio_do_all_uri_def = {
-        .uri       = "/gpio/do/all",
-        .method    = HTTP_GET,
-        .handler   = gpio_do_all_handler,
-        .user_ctx  = NULL
-    };
-
-    httpd_uri_t gpio_overview_uri_def = {
-        .uri       = "/gpio/overview",
-        .method    = HTTP_GET,
-        .handler   = gpio_overview_handler,
-        .user_ctx  = NULL
-    };
-
-    httpd_uri_t network_config_get_uri_def = {
-        .uri       = "/network/config/get",
-        .method    = HTTP_GET,
-        .handler   = network_config_get_handler,
-        .user_ctx  = NULL
-    };
-
-    httpd_uri_t network_config_set_uri_def = {
-        .uri       = "/network/config/set",
-        .method    = HTTP_GET,
-        .handler   = network_config_set_handler,
-        .user_ctx  = NULL
-    };
-
-    httpd_uri_t restart_uri_def = {
-        .uri       = "/restart",
-        .method    = HTTP_GET,
-        .handler   = restart_handler,
-        .user_ctx  = NULL
-    };
-
-    httpd_uri_t neopixel_set_uri_def = {
-        .uri       = "/neopixel/set",
-        .method    = HTTP_GET,
-        .handler   = neopixel_set_handler,
-        .user_ctx  = NULL
-    };
-
-    httpd_uri_t neopixel_off_uri_def = {
-        .uri       = "/neopixel/off",
-        .method    = HTTP_GET,
-        .handler   = neopixel_off_handler,
-        .user_ctx  = NULL
-    };
-
-    Serial.printf("Starting web server on port: '%d'\n", config.server_port);
-    if (httpd_start(&camera_httpd, &config) == ESP_OK) {
-        // Register URI handlers
-        httpd_register_uri_handler(camera_httpd, &index_uri_def);
-        httpd_register_uri_handler(camera_httpd, &cmd_uri_def);
-        httpd_register_uri_handler(camera_httpd, &status_uri_def);
-        httpd_register_uri_handler(camera_httpd, &capture_uri_def);
-        httpd_register_uri_handler(camera_httpd, &stream_uri_def);
+    
+    if (httpd_start(&web_server, &config) == ESP_OK) {
+        // Index page
+        httpd_uri_t index_uri = {
+            .uri = "/",
+            .method = HTTP_GET,
+            .handler = index_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(web_server, &index_uri);
         
         // GPIO handlers
-        httpd_register_uri_handler(camera_httpd, &gpio_do_uri_def);
-        httpd_register_uri_handler(camera_httpd, &gpio_ai_read_uri_def);
-        httpd_register_uri_handler(camera_httpd, &gpio_ao_set_uri_def);
-        httpd_register_uri_handler(camera_httpd, &gpio_do_all_uri_def);
-        httpd_register_uri_handler(camera_httpd, &gpio_overview_uri_def);
+        httpd_uri_t gpio_do_uri = {
+            .uri = "/gpio/do",
+            .method = HTTP_GET,
+            .handler = gpio_do_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(web_server, &gpio_do_uri);
         
-        // Network configuration handlers
-        httpd_register_uri_handler(camera_httpd, &network_config_get_uri_def);
-        httpd_register_uri_handler(camera_httpd, &network_config_set_uri_def);
-        httpd_register_uri_handler(camera_httpd, &restart_uri_def);
+        httpd_uri_t gpio_do_all_uri = {
+            .uri = "/gpio/do/all",
+            .method = HTTP_GET,
+            .handler = gpio_do_all_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(web_server, &gpio_do_all_uri);
+        
+        httpd_uri_t gpio_ai_read_uri = {
+            .uri = "/gpio/ai/read",
+            .method = HTTP_GET,
+            .handler = gpio_ai_read_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(web_server, &gpio_ai_read_uri);
+        
+        httpd_uri_t gpio_ao_set_uri = {
+            .uri = "/gpio/ao/set",
+            .method = HTTP_GET,
+            .handler = gpio_ao_set_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(web_server, &gpio_ao_set_uri);
+        
+        httpd_uri_t gpio_overview_uri = {
+            .uri = "/gpio/overview",
+            .method = HTTP_GET,
+            .handler = gpio_overview_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(web_server, &gpio_overview_uri);
         
         // NeoPixel handlers
-        httpd_register_uri_handler(camera_httpd, &neopixel_set_uri_def);
-        httpd_register_uri_handler(camera_httpd, &neopixel_off_uri_def);
+        httpd_uri_t neopixel_set_uri = {
+            .uri = "/neopixel/set",
+            .method = HTTP_GET,
+            .handler = neopixel_set_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(web_server, &neopixel_set_uri);
+        
+        httpd_uri_t neopixel_off_uri = {
+            .uri = "/neopixel/off",
+            .method = HTTP_GET,
+            .handler = neopixel_off_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(web_server, &neopixel_off_uri);
+        
+        // Network configuration handlers
+        httpd_uri_t network_config_get_uri = {
+            .uri = "/network/config/get",
+            .method = HTTP_GET,
+            .handler = network_config_get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(web_server, &network_config_get_uri);
+        
+        httpd_uri_t network_config_set_uri = {
+            .uri = "/network/config/set",
+            .method = HTTP_GET,
+            .handler = network_config_set_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(web_server, &network_config_set_uri);
+        
+        // Restart handler
+        httpd_uri_t restart_uri = {
+            .uri = "/restart",
+            .method = HTTP_GET,
+            .handler = restart_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(web_server, &restart_uri);
+        
+        Serial.println("Web server started");
+    } else {
+        Serial.println("Failed to start web server");
     }
-
-    // Initialize network configuration
-    initNetworkConfig();
-    
-    // Initialize NeoPixel
-    initNeoPixel();
-    
-    Serial.println("Camera Web Server Started");
 }
